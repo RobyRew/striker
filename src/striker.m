@@ -157,9 +157,8 @@ static void stk_methods(NSMutableString *out, NSString *name, NSString *filter) 
         for (unsigned int i = 0; i < mc; i++) {
             const char *sn = sel_getName(method_getName(ms[i]));
             if (f && !strcasestr(sn, f)) continue;
-            char *types = method_copyTypeEncoding(ms[i]);
+            const char *types = method_getTypeEncoding(ms[i]);
             [out appendFormat:@"  %c %s  %s\n", prefix, sn, types ?: ""];
-            if (types) free(types);
         }
         if (ms) free(ms);
     }
@@ -173,9 +172,8 @@ static void stk_method(NSMutableString *out, NSString *name, NSString *selName) 
     char kind = '-';
     if (!m) { m = class_getClassMethod(cls, sel); kind = '+'; }
     if (!m) { [out appendFormat:@"%@ has no method %@\n", name, selName]; return; }
-    char *types = method_copyTypeEncoding(m);
+    const char *types = method_getTypeEncoding(m);
     [out appendFormat:@"%c[%@ %@]  types=%s  imp=%p\n", kind, name, selName, types ?: "", (void *)method_getImplementation(m)];
-    if (types) free(types);
 }
 
 static void stk_ivars(NSMutableString *out, NSString *name) {
@@ -338,7 +336,7 @@ static void stk_set_arg(NSInvocation *inv, NSUInteger idx, const char *ty, NSStr
             else {
                 unichar c = val.length ? [val characterAtIndex:0] : 0;
                 if (c == '0' || (c >= '1' && c <= '9')) o = (__bridge id)(void *)stk_addr(val);
-                else o = NSClassFromString(val) ?: val;
+                else { Class cls = NSClassFromString(val); o = cls ? (id)cls : (id)val; }
             }
             [inv setArgument:&o atIndex:idx]; break;
         }
@@ -479,11 +477,11 @@ static void stk_range_cb(task_t task, void *ctx, unsigned type, vm_range_t *rang
         vm_range_t r = ranges[i];
         if (r.size < 16) continue;
         @try {
-            Class isa = *(Class *)r.address;
-            if (!CFSetContainsValue(g_class_set, (__bridge const void *)isa)) continue;
+            void *isaPtr = *(void **)r.address;
+            if (!CFSetContainsValue(g_class_set, isaPtr)) continue;
             id obj = (__bridge id)(void *)r.address;
             if ([obj isKindOfClass:g_inst_target])
-                [g_inst_results addObject:[NSString stringWithFormat:@"%p  %s", (void *)r.address, class_getName(isa)]];
+                [g_inst_results addObject:[NSString stringWithFormat:@"%p  %s", (void *)r.address, class_getName(object_getClass(obj))]];
         } @catch (NSException *e) { /* skip candidate */ }
     }
 }
