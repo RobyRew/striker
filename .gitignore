@@ -1,0 +1,19 @@
+.DS_Store
+._*
+
+# theos build output
+.theos/
+packages/
+.build/
+
+# build artifacts
+*.deb
+*.dylib
+*.o
+
+# python / logs / editor
+__pycache__/
+*.pyc
+*.log
+.vscode/
+.swiftpm/
