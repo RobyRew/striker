@@ -33,8 +33,16 @@ void StrikerStart(void);
 // each gets its own port.
 void StrikerStartOnPort(uint16_t port);
 
-// Stops accepting new connections (best effort). In-flight connections finish.
+// Stops accepting new connections; the listener closes its socket within ~0.5 s
+// and a later StrikerStartOnPort() may reuse the port. In-flight connections
+// finish their current command.
 void StrikerStop(void);
+
+// 1 while a listener is bound and accepting, else 0.
+int StrikerIsRunning(void);
+
+// The port of the current/last listener (0 before the first start).
+uint16_t StrikerPort(void);
 
 // Runs one command line on the CURRENT thread and returns a malloc'd UTF-8
 // result the caller frees with StrikerFree(). This is the same dispatch the
@@ -47,6 +55,11 @@ void StrikerFree(char *result);
 // thread - UI reads marshal to the main thread. Lets a host tweak capture a
 // screen's layout to a file without a live socket, e.g. from a lifecycle hook.
 void StrikerDumpKeyWindow(const char *path);
+
+// Appends the view tree rooted at `view` (a UIView *, passed as a raw pointer so
+// this header stays plain C) to `path`, same format as uitree. Use it to capture
+// one screen's subtree, e.g. a feed collection view, instead of the whole window.
+void StrikerDumpView(void *view, const char *path);
 
 #ifdef __cplusplus
 }

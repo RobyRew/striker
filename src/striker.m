@@ -19,6 +19,8 @@
 #import <pthread.h>
 #import <sys/socket.h>
 #import <netinet/in.h>
+#import <poll.h>
+#import <errno.h>
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
 #import <unistd.h>
@@ -81,7 +83,7 @@ static void stk_help(NSMutableString *out) {
      "  ivars <Name>                 ivar names, offsets, types\n"
      "  instances <Name> [max]       live heap instances (experimental)\n"
      "  obj <addr>                   class chain + ivar values\n"
-     "  uitree [depth] [nodes] [all] view hierarchy (frames, a11y id, owning VC)\n"
+     "  uitree [depth] [nodes] [all] view hierarchy (frames, a11y id, text, owning VC)\n"
      "  uivc                         view-controller / presentation tree\n"
      "  uidump [depth] [nodes]       write the view tree to a JSON file\n"
      "  send <obj|Class> <sel> [a..] typed objc_msgSend via NSInvocation\n"
@@ -226,6 +228,30 @@ static void stk_obj(NSMutableString *out, NSString *addrTok) {
 
 #pragma mark - UI hierarchy
 
+// Visible text of a text-bearing view (label / text view / text field), or nil.
+static NSString *stk_view_text(UIView *v) {
+    if ([v isKindOfClass:[UILabel class]]) {
+        UILabel *l = (UILabel *)v;
+        return l.text.length ? l.text : l.attributedText.string;
+    }
+    if ([v isKindOfClass:[UITextView class]]) return ((UITextView *)v).text;
+    if ([v isKindOfClass:[UITextField class]]) {
+        UITextField *t = (UITextField *)v;
+        return t.text.length ? t.text : t.placeholder;
+    }
+    return nil;
+}
+
+// One-line, quote-safe, length-capped rendering of `s` for the text dumps.
+static NSString *stk_quote(NSString *s, NSUInteger max) {
+    if (!s.length) return nil;
+    NSString *c = [[[s stringByReplacingOccurrencesOfString:@"\n" withString:@"\\n"]
+                    stringByReplacingOccurrencesOfString:@"\r" withString:@""]
+                   stringByReplacingOccurrencesOfString:@"\"" withString:@"'"];
+    if (c.length > max) c = [[c substringToIndex:max] stringByAppendingString:@"..."];
+    return c;
+}
+
 static void stk_dump_view(NSMutableString *out, UIView *v, int depth, int maxDepth, int *budget, BOOL all) {
     if (*budget <= 0 || depth > maxDepth) return;
     (*budget)--;
@@ -236,8 +262,13 @@ static void stk_dump_view(NSMutableString *out, UIView *v, int depth, int maxDep
         if ([r isKindOfClass:[UIViewController class]]) { vc = [NSString stringWithFormat:@" vc=%@", NSStringFromClass([r class])]; break; }
     }
     NSString *aid = v.accessibilityIdentifier.length ? [NSString stringWithFormat:@" id=%@", v.accessibilityIdentifier] : @"";
-    [out appendFormat:@"%@%@ <%p> {%.0f,%.0f,%.0f,%.0f}%@%@%@\n", ind, NSStringFromClass([v class]), v,
-     f.origin.x, f.origin.y, f.size.width, f.size.height, v.hidden ? @" hidden" : @"", aid, vc];
+    NSString *txt = stk_quote(stk_view_text(v), 80);
+    NSString *ax = v.isAccessibilityElement ? stk_quote(v.accessibilityLabel, 80) : nil;
+    if (ax && txt && [ax isEqualToString:txt]) ax = nil;
+    [out appendFormat:@"%@%@ <%p> {%.0f,%.0f,%.0f,%.0f}%@%@%@%@%@\n", ind, NSStringFromClass([v class]), v,
+     f.origin.x, f.origin.y, f.size.width, f.size.height, v.hidden ? @" hidden" : @"", aid,
+     txt ? [NSString stringWithFormat:@" text=\"%@\"", txt] : @"",
+     ax ? [NSString stringWithFormat:@" ax=\"%@\"", ax] : @"", vc];
     if (!all && v.hidden) return;
     for (UIView *s in v.subviews) stk_dump_view(out, s, depth + 1, maxDepth, budget, all);
 }
@@ -302,6 +333,8 @@ static NSDictionary *stk_view_json(UIView *v, int depth, int maxDepth, int *budg
         @"frame": @[@(f.origin.x), @(f.origin.y), @(f.size.width), @(f.size.height)],
         @"hidden": @(v.hidden),
         @"accessibilityIdentifier": v.accessibilityIdentifier ?: @"",
+        @"text": stk_view_text(v) ?: @"",
+        @"accessibilityLabel": (v.isAccessibilityElement ? v.accessibilityLabel : nil) ?: @"",
         @"subviews": kids,
     };
 }
@@ -583,6 +616,18 @@ char *StrikerRunLine(const char *line) {
 
 void StrikerFree(char *result) { if (result) free(result); }
 
+// Appends `out` to `path` (or NSTemporaryDirectory()/striker-dump.txt when NULL).
+static void stk_append_to_path(NSString *out, const char *path) {
+    NSString *p = (path && *path) ? [NSString stringWithUTF8String:path]
+        : [(NSString *)NSTemporaryDirectory() stringByAppendingPathComponent:@"striker-dump.txt"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+        if (fh) { [fh seekToEndOfFile]; [fh writeData:[out dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+    } else {
+        [out writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+}
+
 void StrikerDumpKeyWindow(const char *path) {
     @autoreleasepool {
         NSMutableString *out = [NSMutableString string];
@@ -593,19 +638,32 @@ void StrikerDumpKeyWindow(const char *path) {
         } @catch (NSException *e) {
             [out appendFormat:@"dump exception: %@\n", e.reason];
         }
-        NSString *p = (path && *path) ? [NSString stringWithUTF8String:path]
-            : [(NSString *)NSTemporaryDirectory() stringByAppendingPathComponent:@"striker-dump.txt"];
-        if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
-            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
-            if (fh) { [fh seekToEndOfFile]; [fh writeData:[out dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
-        } else {
-            [out writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        }
+        stk_append_to_path(out, path);
     }
 }
 
-static int g_listen_fd = -1;
+void StrikerDumpView(void *view, const char *path) {
+    @autoreleasepool {
+        NSMutableString *out = [NSMutableString string];
+        @try {
+            stk_run_on_main_sync(^{
+                id obj = (__bridge id)view;
+                if (![obj isKindOfClass:[UIView class]]) { [out appendString:@"StrikerDumpView: not a UIView\n"]; return; }
+                UIView *v = (UIView *)obj;
+                [out appendFormat:@"\n===== striker view dump %@ <%p> =====\n", NSStringFromClass([v class]), v];
+                int budget = 8000;
+                stk_dump_view(out, v, 0, 80, &budget, NO);
+            });
+        } @catch (NSException *e) {
+            [out appendFormat:@"dump exception: %@\n", e.reason];
+        }
+        stk_append_to_path(out, path);
+    }
+}
+
+static volatile int g_listen_fd = -1;
 static volatile int g_running = 0;
+static volatile int g_gen = 0;     // bumped by every start/stop; a listener exits when it is stale
 static uint16_t g_port = 0;
 
 static void stk_send_all(int fd, const char *buf, size_t len) {
@@ -637,23 +695,37 @@ static void *stk_client_thread(void *arg) {
 }
 
 static void *stk_listen_thread(void *arg) {
-    (void)arg;
+    int gen = (int)(intptr_t)arg;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) { g_running = 0; return NULL; }
+    if (fd < 0) { if (gen == g_gen) g_running = 0; return NULL; }
     int yes = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
     struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET; addr.sin_port = htons(g_port); addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(fd); g_running = 0; return NULL; }
-    if (listen(fd, 4) < 0) { close(fd); g_running = 0; return NULL; }
+    // A listener from a just-stopped generation can hold the port for up to one
+    // poll interval, so retry the bind briefly instead of failing a quick restart.
+    int bound = -1;
+    for (int i = 0; i < 15 && gen == g_gen; i++) {
+        bound = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+        if (bound == 0) break;
+        usleep(200 * 1000);
+    }
+    if (bound < 0 || listen(fd, 4) < 0) { close(fd); if (gen == g_gen) g_running = 0; return NULL; }
     g_listen_fd = fd;
     NSLog(@"[Striker] listening on 127.0.0.1:%u", g_port);
-    while (g_running) {
+    // poll() with a timeout instead of a blocking accept(): StrikerStop only flips
+    // flags, and this thread - the fd's sole owner - closes it on its way out.
+    while (g_running && gen == g_gen) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+        int r = poll(&pfd, 1, 500);
+        if (r == 0) continue;
+        if (r < 0) { if (errno == EINTR) continue; break; }
         int cfd = accept(fd, NULL, NULL);
-        if (cfd < 0) { if (g_running) continue; else break; }
+        if (cfd < 0) continue;
         pthread_t th; if (pthread_create(&th, NULL, stk_client_thread, (void *)(intptr_t)cfd) == 0) pthread_detach(th);
         else close(cfd);
     }
-    close(fd); g_listen_fd = -1;
+    if (g_listen_fd == fd) g_listen_fd = -1;
+    close(fd);
     return NULL;
 }
 
@@ -661,8 +733,9 @@ void StrikerStartOnPort(uint16_t port) {
     if (g_running) return;
     g_running = 1;
     g_port = port ? port : STRIKER_DEFAULT_PORT;
+    int gen = ++g_gen;
     pthread_t th;
-    if (pthread_create(&th, NULL, stk_listen_thread, NULL) == 0) pthread_detach(th);
+    if (pthread_create(&th, NULL, stk_listen_thread, (void *)(intptr_t)gen) == 0) pthread_detach(th);
     else g_running = 0;
 }
 
@@ -670,5 +743,9 @@ void StrikerStart(void) { StrikerStartOnPort(STRIKER_DEFAULT_PORT); }
 
 void StrikerStop(void) {
     g_running = 0;
-    if (g_listen_fd >= 0) { close(g_listen_fd); g_listen_fd = -1; }
+    g_gen++;
 }
+
+int StrikerIsRunning(void) { return g_running && g_listen_fd >= 0; }
+
+uint16_t StrikerPort(void) { return g_port; }
