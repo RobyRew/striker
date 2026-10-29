@@ -92,6 +92,7 @@ static void stk_help(NSMutableString *out) {
      "  ls <path>                    list a directory\n"
      "  home                         sandbox home / Documents / tmp paths\n"
      "  logtail [n] [path]           tail the striker log (or a file)\n"
+     "  logtree [path]               dump key-window view+VC tree to a file\n"
      "Roadmap (not in this build): watch, hooksel, hookvt, unhook, scanmem, sqlite, http\n"];
 }
 
@@ -567,6 +568,7 @@ static void stk_dispatch(const char *line, NSMutableString *out) {
     else if ([cmd isEqualToString:@"ls"]) stk_ls(out, arg(0));
     else if ([cmd isEqualToString:@"home"]) stk_home(out);
     else if ([cmd isEqualToString:@"logtail"]) stk_logtail(out, (size_t)stk_addr(arg(0)), arg(1));
+    else if ([cmd isEqualToString:@"logtree"]) { StrikerDumpKeyWindow(a.count > 0 ? a[0].UTF8String : NULL); [out appendString:@"wrote key-window view+VC tree to the dump file\n"]; }
     else [out appendFormat:@"unknown command: %@ (try 'help')\n", cmd];
 }
 
@@ -580,6 +582,27 @@ char *StrikerRunLine(const char *line) {
 }
 
 void StrikerFree(char *result) { if (result) free(result); }
+
+void StrikerDumpKeyWindow(const char *path) {
+    @autoreleasepool {
+        NSMutableString *out = [NSMutableString string];
+        [out appendString:@"\n===== striker key-window dump =====\n"];
+        @try {
+            stk_uivc(out, 4000);
+            stk_uitree(out, 60, 8000, NO);
+        } @catch (NSException *e) {
+            [out appendFormat:@"dump exception: %@\n", e.reason];
+        }
+        NSString *p = (path && *path) ? [NSString stringWithUTF8String:path]
+            : [(NSString *)NSTemporaryDirectory() stringByAppendingPathComponent:@"striker-dump.txt"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+            if (fh) { [fh seekToEndOfFile]; [fh writeData:[out dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+        } else {
+            [out writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+    }
+}
 
 static int g_listen_fd = -1;
 static volatile int g_running = 0;

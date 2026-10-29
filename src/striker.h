@@ -42,6 +42,12 @@ void StrikerStop(void);
 char *StrikerRunLine(const char *line);
 void StrikerFree(char *result);
 
+// Appends the current key window's view + view-controller hierarchy to `path`
+// (or NSTemporaryDirectory()/striker-dump.txt when NULL). Safe to call from any
+// thread - UI reads marshal to the main thread. Lets a host tweak capture a
+// screen's layout to a file without a live socket, e.g. from a lifecycle hook.
+void StrikerDumpKeyWindow(const char *path);
+
 #ifdef __cplusplus
 }
 #endif
